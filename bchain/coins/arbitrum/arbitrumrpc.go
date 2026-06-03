@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 
+	"github.com/ethereum/go-ethereum/rpc"
 	"github.com/golang/glog"
 	"github.com/juju/errors"
 	"github.com/trezor/blockbook/bchain"
@@ -83,13 +84,17 @@ func (b *ArbitrumRPC) Initialize() error {
 	// classic-era blocks and falls back to the standard debug_trace path for
 	// nitro-era blocks (one indexer covers the whole chain transparently).
 	if b.ChainConfig.ClassicTraceRPCURL != "" {
-		// Same URL for http and ws — classic tracing is request/response,
-		// no subscriptions needed. OpenRPC will dedupe and create a single conn.
-		crc, _, cerr := eth.OpenRPC(b.ChainConfig.ClassicTraceRPCURL, b.ChainConfig.ClassicTraceRPCURL)
+		// Classic tracing is request/response only — no subscriptions — so we
+		// dial directly instead of going through eth.OpenRPC (which requires a
+		// matching ws URL). The lightweight EthereumRPCClient wrapper is enough
+		// to satisfy bchain.EVMRPCClient for CallContext/BatchCallContext.
+		dialCtx, dialCancel := context.WithTimeout(context.Background(), b.Timeout)
+		classicConn, cerr := rpc.DialContext(dialCtx, b.ChainConfig.ClassicTraceRPCURL)
+		dialCancel()
 		if cerr != nil {
 			return errors.Annotatef(cerr, "classic trace rpc %s", b.ChainConfig.ClassicTraceRPCURL)
 		}
-		b.ClassicTraceRPC = crc
+		b.ClassicTraceRPC = &eth.EthereumRPCClient{Client: classicConn}
 		glog.Infof("rpc: classic trace fallback armed url=%s cutoffBlock=%d",
 			b.ChainConfig.ClassicTraceRPCURL, b.ChainConfig.ClassicTraceCutoffBlock)
 	}
