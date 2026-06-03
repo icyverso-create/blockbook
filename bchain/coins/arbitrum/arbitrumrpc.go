@@ -75,6 +75,25 @@ func (b *ArbitrumRPC) Initialize() error {
 		return err
 	}
 
+	// Wire up an optional Parity-trace JSON-RPC client used for blocks at or
+	// below ChainConfig.ClassicTraceCutoffBlock. On Arbitrum One the pre-Nitro
+	// chain (blocks <= 22207816) is served by a separate arb-classic node that
+	// exposes trace_block but not debug_traceBlockByHash. When configured, the
+	// upstream eth.EthereumRPC.getInternalDataForBlock prefers this client for
+	// classic-era blocks and falls back to the standard debug_trace path for
+	// nitro-era blocks (one indexer covers the whole chain transparently).
+	if b.ChainConfig.ClassicTraceRPCURL != "" {
+		// Same URL for http and ws — classic tracing is request/response,
+		// no subscriptions needed. OpenRPC will dedupe and create a single conn.
+		crc, _, cerr := eth.OpenRPC(b.ChainConfig.ClassicTraceRPCURL, b.ChainConfig.ClassicTraceRPCURL)
+		if cerr != nil {
+			return errors.Annotatef(cerr, "classic trace rpc %s", b.ChainConfig.ClassicTraceRPCURL)
+		}
+		b.ClassicTraceRPC = crc
+		glog.Infof("rpc: classic trace fallback armed url=%s cutoffBlock=%d",
+			b.ChainConfig.ClassicTraceRPCURL, b.ChainConfig.ClassicTraceCutoffBlock)
+	}
+
 	glog.Info("rpc: block chain ", b.Network)
 
 	return nil

@@ -100,6 +100,12 @@ type Configuration struct {
 	QueryBackendOnMempoolResync       bool   `json:"queryBackendOnMempoolResync"`
 	ProcessInternalTransactions       bool   `json:"processInternalTransactions"`
 	ProcessZeroInternalTransactions   bool   `json:"processZeroInternalTransactions"`
+	// ClassicTraceRPCURL is an optional secondary JSON-RPC endpoint that
+	// exposes Parity-style trace_block for blocks <= ClassicTraceCutoffBlock.
+	// Used for chains with a split classic/nitro history (Arbitrum One) where
+	// the primary node cannot execute debug_trace on pre-migration blocks.
+	ClassicTraceRPCURL      string `json:"classicTraceRpcUrl,omitempty"`
+	ClassicTraceCutoffBlock uint32 `json:"classicTraceCutoffBlock,omitempty"`
 	ConsensusNodeVersionURL           string `json:"consensusNodeVersion"`
 	DisableMempoolSync                bool   `json:"disableMempoolSync,omitempty"`
 	Eip1559Fees                       bool   `json:"eip1559Fees,omitempty"`
@@ -202,6 +208,10 @@ type EthereumRPC struct {
 	alternativeFeeProvider    alternativeFeeProviderInterface
 	alternativeSendTxProvider *AlternativeSendTxProvider
 	InternalDataProvider      bchain.EthereumInternalDataProvider
+	// ClassicTraceRPC is an optional Parity-trace-capable JSON-RPC client used
+	// to fetch internal data for blocks at or below ChainConfig.ClassicTraceCutoffBlock.
+	// Set by chain-specific Initialize (e.g. ArbitrumRPC) when ChainConfig.ClassicTraceRPCURL is non-empty.
+	ClassicTraceRPC           bchain.EVMRPCClient
 	consensusMonitor          *consensusVersionMonitor
 	// Multicall3 deployment state; lazily probed on first call. See multicall.go.
 	multicall3Probe   atomic.Int32
@@ -1458,6 +1468,15 @@ func (b *EthereumRPC) processCallTrace(call *rpcCallTrace, d *bchain.EthereumInt
 func (b *EthereumRPC) getInternalDataForBlock(ctx context.Context, blockHash string, blockHeight uint32, transactions []bchain.RpcTransaction) ([]bchain.EthereumInternalData, []bchain.ContractInfo, error) {
 	if b.InternalDataProvider != nil {
 		return b.InternalDataProvider.GetInternalDataForBlock(blockHash, blockHeight, transactions)
+	}
+
+	// For chains with a split classic/nitro history (e.g. Arbitrum One), blocks at or below
+	// ChainConfig.ClassicTraceCutoffBlock cannot be traced via debug_traceBlockByHash because
+	// the post-migration node does not retain pre-migration EVM state. When ClassicTraceRPC is
+	// configured (typically pointing at an arb-classic archive node), we fetch internal data
+	// from there via Parity-style trace_block.
+	if bchain.ProcessInternalTransactions && b.ClassicTraceRPC != nil && blockHeight <= b.ChainConfig.ClassicTraceCutoffBlock {
+		return b.getClassicEraInternalData(ctx, blockHeight, transactions)
 	}
 
 	data := make([]bchain.EthereumInternalData, len(transactions))
