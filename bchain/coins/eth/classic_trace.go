@@ -66,6 +66,16 @@ func (b *EthereumRPC) getClassicEraInternalData(ctx context.Context, blockHeight
 	data := make([]bchain.EthereumInternalData, len(transactions))
 	contracts := make([]bchain.ContractInfo, 0)
 
+	// Skip the trace round-trip on empty blocks. Classic arb-node has to
+	// re-execute state from the previous checkpoint for trace_block calls; on
+	// the vast majority of pre-Nitro blocks the result is just an empty array
+	// anyway. With 8+ concurrent workers this short-circuit alone cuts
+	// classic-era sync wall-clock by ~10-100x because the long stretches of
+	// zero-tx blocks at the start of the chain stop pinning the classic node.
+	if len(transactions) == 0 {
+		return data, contracts, nil
+	}
+
 	// trace_block accepts a quantity (block number) as the single param.
 	blockParam := "0x" + strconv.FormatUint(uint64(blockHeight), 16)
 
