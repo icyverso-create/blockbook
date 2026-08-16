@@ -35,6 +35,7 @@ type BulkConnect struct {
 	height             uint32
 	bulkStats          bulkConnectStats
 	bulkHotness        bulkHotnessStats
+	isInconsistent     bool // tracks if DB was set to inconsistent state
 }
 
 const (
@@ -85,6 +86,7 @@ func (d *RocksDB) InitBulkConnect() (*BulkConnect, error) {
 		balances:         make(map[string]*AddrBalance),
 		addressContracts: make(map[string]*unpackedAddrContracts),
 		blockFilters:     make(map[string][]byte),
+		isInconsistent:   true,
 	}
 	if err := d.SetInconsistentState(true); err != nil {
 		return nil, err
@@ -93,6 +95,23 @@ func (d *RocksDB) InitBulkConnect() (*BulkConnect, error) {
 		d.addrContractsCacheMaxBytes = d.bulkAddrContractsCacheMaxBytes
 	}
 	glog.Info("rocksdb: bulk connect init, db set to inconsistent state")
+	return b, nil
+}
+
+// InitBulkConnectWithoutInconsistentState initializes bulk connect WITHOUT setting inconsistent state
+// This allows API to remain available during sync, suitable for live sync with hot caches
+// If process crashes, DB will be in consistent state but may need resyncing from last checkpoint
+func (d *RocksDB) InitBulkConnectWithoutInconsistentState() (*BulkConnect, error) {
+	b := &BulkConnect{
+		d:                d,
+		chainType:        d.chainParser.GetChainType(),
+		txAddressesMap:   make(map[string]*TxAddresses),
+		balances:         make(map[string]*AddrBalance),
+		addressContracts: make(map[string]*unpackedAddrContracts),
+		blockFilters:     make(map[string][]byte),
+		isInconsistent:   false,
+	}
+	glog.Info("rocksdb: bulk connect init, keeping db in consistent state (API available)")
 	return b, nil
 }
 
@@ -506,6 +525,72 @@ func (b *BulkConnect) ConnectBlock(block *bchain.Block, storeBlockTxs bool) erro
 	return b.d.ConnectBlock(block)
 }
 
+// FlushAll flushes all cached bulk data (addresses, heights, txAddresses,
+// balances, addressContracts, blockFilters) to RocksDB, resetting in-memory
+// caches so the BulkConnect can keep being used. Unlike Close(), it does NOT:
+//   - call setBlockTimes (expensive O(N) scan, only needed at startup)
+//   - touch SetInconsistentState
+//   - nil out b.d
+//
+// This is the chunked-flush primitive used by ContinuousBulkSync to advance
+// disk state at chunk boundaries while keeping the BulkConnect alive.
+func (b *BulkConnect) FlushAll() error {
+	start := time.Now()
+	var storeTxAddressesChan, storeBalancesChan, storeAddressContractsChan chan error
+	if b.chainType == bchain.ChainBitcoinType {
+		storeTxAddressesChan = make(chan error)
+		go b.parallelStoreTxAddresses(storeTxAddressesChan, true)
+		storeBalancesChan = make(chan error)
+		go b.parallelStoreBalances(storeBalancesChan, true)
+	} else if b.chainType == bchain.ChainEthereumType {
+		storeAddressContractsChan = make(chan error)
+		go b.parallelStoreAddressContracts(storeAddressContractsChan, true)
+	}
+	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	if err := b.d.storeInternalDataEthereumType(wb, b.ethBlockTxs); err != nil {
+		return err
+	}
+	b.ethBlockTxs = b.ethBlockTxs[:0]
+	bac := b.bulkAddressesCount
+	if err := b.storeBulkAddresses(wb); err != nil {
+		return err
+	}
+	if err := b.storeBulkBlockFilters(wb); err != nil {
+		return err
+	}
+	if err := b.d.WriteBatch(wb); err != nil {
+		return err
+	}
+	if storeTxAddressesChan != nil {
+		if err := <-storeTxAddressesChan; err != nil {
+			return err
+		}
+	}
+	if storeBalancesChan != nil {
+		if err := <-storeBalancesChan; err != nil {
+			return err
+		}
+	}
+	if storeAddressContractsChan != nil {
+		if err := <-storeAddressContractsChan; err != nil {
+			return err
+		}
+	}
+	suffix := b.statsLogSuffix()
+	if b.d.hotAddrTracker != nil {
+		suffix += b.d.hotAddrTracker.LogSuffix()
+	}
+	glog.Info("rocksdb: BulkConnect.FlushAll height ", b.height, ", flushed ", bac, " addresses, done in ", time.Since(start), suffix)
+	// FlushAll is the only flush point during ContinuousBulkSync (Close is never
+	// reached in steady state), so publish and reset the 0.6.0 sync stats here
+	// exactly as Close does — otherwise the gauges would stay dead for the
+	// whole lifetime of the process.
+	b.updateSyncMetrics("bulk")
+	b.resetStats()
+	return nil
+}
+
 // Close flushes the cached data, restores tip cache sizing, and switches DB from inconsistent state open
 // after Close, the BulkConnect cannot be used
 func (b *BulkConnect) Close() error {
@@ -568,10 +653,15 @@ func (b *BulkConnect) Close() error {
 			return err
 		}
 	}
-	if err := b.d.SetInconsistentState(false); err != nil {
-		return err
+	// only reset inconsistent state if it was set
+	if b.isInconsistent {
+		if err := b.d.SetInconsistentState(false); err != nil {
+			return err
+		}
+		glog.Info("rocksdb: bulk connect closed, db set to open state")
+	} else {
+		glog.Info("rocksdb: bulk connect closed, db remained in open state")
 	}
-	glog.Info("rocksdb: bulk connect closed, db set to open state")
 
 	// set block times asynchronously (if not in unit test), it slows server startup for chains with large number of blocks
 	d := b.d

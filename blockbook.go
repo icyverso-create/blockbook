@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"flag"
+	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -89,6 +92,8 @@ var (
 	resyncMempoolPeriodMs = flag.Int("resyncmempoolperiod", 60017, "resync mempool period in milliseconds")
 
 	extendedIndex = flag.Bool("extendedindex", false, "if true, create index of input txids and spending transactions")
+
+	dumpBalance = flag.String("dump-balance", "", "debug: open db, dump balance for hex addrDesc, exit")
 )
 
 var (
@@ -217,9 +222,20 @@ func mainWithExitCode() int {
 		glog.Info("shutdown: rocksdb close finished")
 	}()
 
+	if *dumpBalance != "" {
+		return dumpBalanceAndExit(*dumpBalance)
+	}
+
 	internalState, err = newInternalState(config, index, *enableSubNewTx)
 	if err != nil {
 		glog.Error("internalState: ", err)
+		return exitCodeFatal
+	}
+
+	// the DB is confirmed compatible only once newInternalState has validated the
+	// column versions, so collapse the blacklisted balance blobs only now
+	if err := index.CleanupBlacklistedBalances(); err != nil {
+		glog.Error("cleanupBlacklistedBalances: ", err)
 		return exitCodeFatal
 	}
 
@@ -352,6 +368,12 @@ func mainWithExitCode() int {
 			glog.Error("public server: ", err)
 			return exitCodeFatal
 		}
+		// start full public interface immediately (before sync)
+		// this allows API to be available during ContinuousBulkSync
+		callbacksOnNewBlock = append(callbacksOnNewBlock, publicServer.OnNewBlock)
+		callbacksOnNewTx = append(callbacksOnNewTx, publicServer.OnNewTx)
+		callbacksOnNewFiatRatesTicker = append(callbacksOnNewFiatRatesTicker, publicServer.OnNewFiatRatesTicker)
+		publicServer.ConnectFullPublicInterface()
 	}
 
 	if *synchronize {
@@ -385,14 +407,6 @@ func mainWithExitCode() int {
 		internalState.InitialSync = false
 	}
 	go storeInternalStateLoop()
-
-	if publicServer != nil {
-		// start full public interface
-		callbacksOnNewBlock = append(callbacksOnNewBlock, publicServer.OnNewBlock)
-		callbacksOnNewTx = append(callbacksOnNewTx, publicServer.OnNewTx)
-		callbacksOnNewFiatRatesTicker = append(callbacksOnNewFiatRatesTicker, publicServer.OnNewFiatRatesTicker)
-		publicServer.ConnectFullPublicInterface()
-	}
 
 	if *blockFrom >= 0 {
 		if *blockUntil < 0 {
@@ -816,6 +830,82 @@ func runStartupSelfHealing() {
 		// aborts it promptly instead of blocking startup-shutdown until the backfill ends.
 		fiatRates.ReconcileHistoricalRatesAtStartup(chanOsSignal)
 	}
+}
+
+func dumpBalanceAndExit(hexAddrDesc string) int {
+	addrDesc, err := hex.DecodeString(hexAddrDesc)
+	if err != nil {
+		glog.Error("dump-balance: bad hex: ", err)
+		return exitCodeFatal
+	}
+	ab, err := index.GetAddrDescBalance(addrDesc, db.AddressBalanceDetailUTXO)
+	if err != nil {
+		glog.Error("dump-balance: ", err)
+		return exitCodeFatal
+	}
+	if ab == nil {
+		fmt.Println("NOT FOUND")
+		return exitCodeOK
+	}
+	fmt.Printf("addrDesc: %x\n", addrDesc)
+	fmt.Printf("Txs: %d\n", ab.Txs)
+	fmt.Printf("BalanceSat: %v\n", &ab.BalanceSat)
+	fmt.Printf("SentSat: %v\n", &ab.SentSat)
+	fmt.Printf("Utxos len: %d\n", len(ab.Utxos))
+
+	txidCount := map[string]int{}
+	heightCount := map[uint32]int{}
+	var firstHeight, lastHeight uint32
+	firstHeight = ^uint32(0)
+	for i := range ab.Utxos {
+		u := &ab.Utxos[i]
+		txidCount[hex.EncodeToString(u.BtxID)]++
+		heightCount[u.Height]++
+		if u.Height < firstHeight {
+			firstHeight = u.Height
+		}
+		if u.Height > lastHeight {
+			lastHeight = u.Height
+		}
+	}
+	fmt.Printf("Unique txids in Utxos: %d\n", len(txidCount))
+	fmt.Printf("Unique heights: %d  range: %d..%d\n", len(heightCount), firstHeight, lastHeight)
+	type kv struct {
+		Key   string
+		Count int
+	}
+	var dups []kv
+	for k, c := range txidCount {
+		if c > 1 {
+			dups = append(dups, kv{k, c})
+		}
+	}
+	sort.Slice(dups, func(i, j int) bool { return dups[i].Count > dups[j].Count })
+	fmt.Printf("txids with duplicates: %d (showing top 10)\n", len(dups))
+	for i := 0; i < 10 && i < len(dups); i++ {
+		fmt.Printf("  %s: %d\n", dups[i].Key, dups[i].Count)
+	}
+	if len(ab.Utxos) > 0 {
+		u := &ab.Utxos[0]
+		fmt.Printf("first utxo: txid=%x vout=%d height=%d value=%v\n", u.BtxID, u.Vout, u.Height, &u.ValueSat)
+		u = &ab.Utxos[len(ab.Utxos)-1]
+		fmt.Printf("last utxo : txid=%x vout=%d height=%d value=%v\n", u.BtxID, u.Vout, u.Height, &u.ValueSat)
+		// height histogram bucketed by 100k blocks
+		buckets := map[uint32]int{}
+		for i := range ab.Utxos {
+			buckets[ab.Utxos[i].Height/100000]++
+		}
+		fmt.Println("Height histogram (bucket=100k blocks):")
+		var bks []uint32
+		for b := range buckets {
+			bks = append(bks, b)
+		}
+		sort.Slice(bks, func(i, j int) bool { return bks[i] < bks[j] })
+		for _, b := range bks {
+			fmt.Printf("  %d-%d: %d utxos\n", b*100000, b*100000+99999, buckets[b])
+		}
+	}
+	return exitCodeOK
 }
 
 func initDownloaders(db *db.RocksDB, chain bchain.BlockChain, config *common.Config) {

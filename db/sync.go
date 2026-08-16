@@ -272,23 +272,19 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 		if remoteBestHeight < w.startHeight {
 			glog.Warning("resync: observed remote best height ", remoteBestHeight, " less than sync start height ", w.startHeight, ", falling back to sequential sync")
 		} else {
-			if initialSync {
-				if remoteBestHeight-w.startHeight > uint32(w.syncChunk) {
-					glog.Infof("resync: bulk sync of blocks %d-%d, using %d workers", w.startHeight, remoteBestHeight, w.syncWorkers)
-					// Bulk sync can encounter a disappearing block hash during reorgs.
-					// When that happens, it returns errResync to trigger a full restart.
-					err = w.BulkConnectBlocks(w.startHeight, remoteBestHeight)
-					if err != nil {
-						if stdErrors.Is(err, errResync) {
-							// block hash changed during parallel sync, restart the full resync
-							return w.resyncIndex(onNewBlock, initialSync)
-						}
-						return err
-					}
-					// after parallel load finish the sync using standard way,
-					// new blocks may have been created in the meantime
+			// always use ContinuousBulkSync for fast-block-generation networks (doge testnet etc.).
+			// CBS runs for the lifetime of the process: it processes blocks in chunks, flushes
+			// each chunk to RocksDB via bc.FlushAll(), and sleeps when caught up with the tip.
+			// It returns only on OS signal (clean shutdown) or on reorg (lets fork handler take over).
+			blocksToSync := remoteBestHeight - w.startHeight
+			if initialSync || blocksToSync > 0 {
+				glog.Infof("resync: continuous bulk sync starting from %d, using %d workers", w.startHeight, w.syncWorkers)
+				err = w.ContinuousBulkSync(w.startHeight)
+				if stdErrors.Is(err, errResync) {
+					// a worker saw a hash that no longer matches the chain, realign
 					return w.resyncIndex(onNewBlock, initialSync)
 				}
+				return err
 			}
 			if w.chain.GetChainParser().GetChainType() == bchain.ChainEthereumType {
 				syncWorkers := uint32(4)
@@ -1005,6 +1001,265 @@ func (w *SyncWorker) getBlockChain(out chan blockResult, done chan struct{}) {
 		hash = block.Next
 		height++
 		out <- blockResult{block: block}
+	}
+}
+
+// ContinuousBulkSync syncs blocks in bulk mode without ever calling BulkConnect.Close()
+// in steady state. Designed for fast-block-generation networks (e.g., Doge testnet)
+// where per-block writes after exiting bulk mode are too slow to keep up.
+//
+// Behavior:
+//   - Processes blocks in chunks of up to procChunkBlocks blocks per iteration.
+//   - At each chunk boundary, calls bc.FlushAll() so cfHeight, addresses,
+//     txAddresses, balances all advance on disk — making the data queryable
+//     and resumable across restarts.
+//   - When caught up with the chain tip, sleeps tipPollInterval and continues.
+//     If unflushed blocks exist past maxAccumulationTime, force-flushes anyway.
+//   - At chunk boundaries, verifies last-flushed hash still on chain. On mismatch,
+//     returns nil so the standard fork handler takes over on the next resync.
+//   - Returns only on OS signal (ErrOperationInterrupted) or RPC error.
+//   - DB stays marked consistent throughout — API serves correct data up to last
+//     flushed chunk for the entire lifetime of the process.
+func (w *SyncWorker) ContinuousBulkSync(lower uint32) error {
+	bc, err := w.db.InitBulkConnectWithoutInconsistentState()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := bc.Close(); cerr != nil {
+			glog.Error("ContinuousBulkSync: BulkConnect.Close error ", cerr)
+		}
+	}()
+
+	currentHeight := lower
+	keep := uint32(w.chain.GetChainParser().KeepBlockAddresses())
+	const procChunkBlocks = uint32(5000)
+	// Aggressive tip-following: flush after every chunk (even 1 block), poll
+	// fast. On doge testnet (chain rate ~5 blocks/sec) this gives lag 0-1 at
+	// steady tip. FlushAll is ~10-50ms under the v8 split schema, so per-block
+	// flush is cheap. During catch-up chunks are still 5000 blocks → one big
+	// amortized flush per chunk.
+	const minFlushBlocks = uint32(1)
+	const maxAccumulationTime = 500 * time.Millisecond
+	const tipPollInterval = 50 * time.Millisecond
+
+	var lastFlushHeight uint32
+	if lower > 0 {
+		lastFlushHeight = lower - 1
+	}
+	lastFlushTime := time.Now()
+	// Reorg check is expensive (2 RPC + 1 RocksDB Get per iteration). On
+	// fast-block chains at tip we hit this every ~200ms, eating ~60-100ms per
+	// cycle and pushing per-block latency above the chain rate. Throttle to
+	// once per `reorgCheckInterval`. Reorgs of 1-2 blocks are rare on doge
+	// testnet anyway, and on a real reorg the standard fork-handler picks it
+	// up at the next ResyncIndex tick.
+	const reorgCheckInterval = 5 * time.Second
+	lastReorgCheck := time.Now()
+
+	flushIfDue := func(force bool) error {
+		unflushed := uint32(0)
+		if currentHeight > 0 && currentHeight-1 > lastFlushHeight {
+			unflushed = currentHeight - 1 - lastFlushHeight
+		}
+		if !force && unflushed < minFlushBlocks && time.Since(lastFlushTime) < maxAccumulationTime {
+			return nil
+		}
+		if unflushed == 0 {
+			return nil
+		}
+		flushStart := time.Now()
+		if ferr := bc.FlushAll(); ferr != nil {
+			return ferr
+		}
+		glog.Infof("ContinuousBulkSync: flushed %d blocks up to height %d in %s", unflushed, currentHeight-1, time.Since(flushStart))
+		lastFlushHeight = currentHeight - 1
+		lastFlushTime = time.Now()
+		return nil
+	}
+
+	for {
+		select {
+		case <-w.chanOsSignal:
+			glog.Info("ContinuousBulkSync interrupted at height ", currentHeight)
+			return ErrOperationInterrupted
+		default:
+		}
+
+		remoteBestHeight, rerr := w.chain.GetBestBlockHeight()
+		if rerr != nil {
+			glog.Error("ContinuousBulkSync: GetBestBlockHeight error ", rerr)
+			time.Sleep(tipPollInterval)
+			continue
+		}
+
+		if remoteBestHeight < currentHeight {
+			// Caught up to tip. Force-flush whatever's pending so the on-disk
+			// cfHeight matches our current view, then exit CBS cleanly with nil.
+			// This lets ResyncIndex set IsSynchronized=true via FinishedSync,
+			// and lets blockbook.go run mempool init + start syncIndexLoop /
+			// syncMempoolLoop. Subsequent ZMQ-driven block arrivals are handled
+			// by the standard per-block path (which on the v8 schema with
+			// blacklisted fat addresses processes a block in ~30-50ms).
+			if ferr := flushIfDue(true); ferr != nil {
+				return ferr
+			}
+			glog.Infof("ContinuousBulkSync: caught up at height %d, exiting CBS so standard tip-following + mempool init can run", currentHeight-1)
+			return nil
+		}
+
+		if lastFlushHeight > lower && time.Since(lastReorgCheck) >= reorgCheckInterval {
+			localHash, lerr := w.db.GetBlockHash(lastFlushHeight)
+			if lerr == nil && localHash != "" {
+				remoteHash, rerr2 := w.chain.GetBlockHash(lastFlushHeight)
+				if rerr2 == nil && remoteHash != "" && remoteHash != localHash {
+					glog.Warningf("ContinuousBulkSync: reorg detected at height %d (local=%s remote=%s), exiting CBS", lastFlushHeight, localHash, remoteHash)
+					if ferr := flushIfDue(true); ferr != nil {
+						glog.Error("ContinuousBulkSync: pre-exit flush error ", ferr)
+					}
+					return nil
+				}
+			}
+			lastReorgCheck = time.Now()
+		}
+
+		avail := remoteBestHeight - currentHeight + 1
+		chunk := avail
+		if chunk > procChunkBlocks {
+			chunk = procChunkBlocks
+		}
+		chunkEnd := currentHeight + chunk - 1
+
+		glog.Infof("ContinuousBulkSync: connecting blocks %d-%d (chunkSize=%d, lag=%d)", currentHeight, chunkEnd, chunk, remoteBestHeight-currentHeight)
+
+		var wg sync.WaitGroup
+		bch := make([]chan *bchain.Block, w.syncWorkers)
+		for i := 0; i < w.syncWorkers; i++ {
+			bch[i] = make(chan *bchain.Block)
+		}
+		hch := make(chan hashHeight, w.syncWorkers)
+		hchClosed := atomic.Value{}
+		hchClosed.Store(false)
+		writeBlockDone := make(chan struct{})
+		terminating := make(chan struct{})
+		// 0.6.0: workers report a resync-worthy reorg or a terminal error here.
+		// Buffered so the first reporter never blocks while we tear the chunk down.
+		abortCh := make(chan error, 1)
+		var connectErr error
+		var connectErrMu sync.Mutex
+
+		writeBlockWorker := func() {
+			defer close(writeBlockDone)
+			lastBlock := currentHeight - 1
+		WriteBlockLoop:
+			for {
+				select {
+				case b := <-bch[(lastBlock+1)%uint32(w.syncWorkers)]:
+					if b == nil {
+						break WriteBlockLoop
+					}
+					if b.Height != lastBlock+1 {
+						glog.Fatal("writeBlockWorker skipped block, expected block ", lastBlock+1, ", new block ", b.Height)
+					}
+					if cerr := bc.ConnectBlock(b, b.Height+keep > chunkEnd); cerr != nil {
+						connectErrMu.Lock()
+						connectErr = cerr
+						connectErrMu.Unlock()
+						glog.Error("writeBlockWorker ", b.Height, " ", b.Hash, " error ", cerr)
+						break WriteBlockLoop
+					}
+					lastBlock = b.Height
+				case <-terminating:
+					break WriteBlockLoop
+				}
+			}
+		}
+
+		for i := 0; i < w.syncWorkers; i++ {
+			wg.Add(1)
+			go w.getBlockWorker(i, uint32(w.syncWorkers), &wg, hch, bch, &hchClosed, terminating, abortCh)
+		}
+		go writeBlockWorker()
+
+		var fetchErr error
+		start := time.Now()
+	ConnectLoop:
+		for h := currentHeight; h <= chunkEnd; {
+			select {
+			case abortErr := <-abortCh:
+				if stdErrors.Is(abortErr, errResync) {
+					glog.Warning("ContinuousBulkSync: aborted by worker, restarting sync")
+				} else {
+					glog.Error("ContinuousBulkSync: aborted, worker error ", abortErr)
+				}
+				close(terminating)
+				fetchErr = abortErr
+				break ConnectLoop
+			case <-w.chanOsSignal:
+				glog.Info("ContinuousBulkSync interrupted at height ", h)
+				close(terminating)
+				fetchErr = ErrOperationInterrupted
+				break ConnectLoop
+			default:
+				hash, herr := w.chain.GetBlockHash(h)
+				if herr != nil {
+					glog.Error("ContinuousBulkSync: GetBlockHash error ", herr)
+					w.metrics.IndexResyncErrors.With(common.Labels{"error": "failure"}).Inc()
+					time.Sleep(time.Millisecond * 500)
+					continue
+				}
+				if serr := w.sendHashHeight(hch, abortCh, hashHeight{hash, h}); serr != nil {
+					if stdErrors.Is(serr, errResync) {
+						glog.Warning("ContinuousBulkSync: aborted while queueing block hash, restarting sync")
+					} else if !stdErrors.Is(serr, ErrOperationInterrupted) {
+						glog.Error("ContinuousBulkSync: aborted while queueing block hash, worker error ", serr)
+					}
+					close(terminating)
+					fetchErr = serr
+					break ConnectLoop
+				}
+				if h > 0 && h%1000 == 0 {
+					w.metrics.BlockbookBestHeight.Set(float64(h))
+					glog.Info("ContinuousBulkSync: connecting block ", h, " ", hash, ", elapsed ", time.Since(start), " ", w.db.GetAndResetConnectBlockStats())
+					start = time.Now()
+				}
+				h++
+			}
+		}
+
+		close(hch)
+		hchClosed.Store(true)
+		wg.Wait()
+		// Hardening (mirrors BulkConnectBlocks): a worker can report a terminal
+		// tail error after ConnectLoop already ended. Drain once so the chunk
+		// does not complete silently on a failure.
+		select {
+		case abortErr := <-abortCh:
+			if fetchErr == nil {
+				fetchErr = abortErr
+			}
+		default:
+		}
+		for i := 0; i < w.syncWorkers; i++ {
+			close(bch[i])
+		}
+		<-writeBlockDone
+
+		if fetchErr != nil {
+			return fetchErr
+		}
+		connectErrMu.Lock()
+		ce := connectErr
+		connectErrMu.Unlock()
+		if ce != nil {
+			return ce
+		}
+
+		currentHeight = chunkEnd + 1
+
+		if ferr := flushIfDue(false); ferr != nil {
+			return ferr
+		}
 	}
 }
 

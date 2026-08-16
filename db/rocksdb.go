@@ -23,7 +23,7 @@ import (
 	"github.com/trezor/blockbook/common"
 )
 
-const dbVersion = 7
+const dbVersion = 8
 
 const packedHeightBytes = 4
 const maxAddrDescLen = 1024
@@ -111,6 +111,14 @@ const (
 	cfAddressBalance
 	cfTxAddresses
 	cfBlockFilter
+	// cfAddressUtxos: separate column for per-address UTXOs.
+	// Key  = len(addrDesc) | addrDesc | btxID | varint(vout)
+	// Val  = varint(height) | varintBig(valueSat)
+	// Per-block update writes/deletes individual UTXO keys (delta only),
+	// avoiding the O(N-utxos-on-address) write amplification that the old
+	// inline schema caused on heavy addresses (e.g. doge testnet faucet
+	// adresses with 46M+ UTXOs).
+	cfAddressUtxos
 
 	__break__
 
@@ -134,8 +142,29 @@ var cfNames []string
 var cfBaseNames = []string{"default", "height", "addresses", "blockTxs", "transactions", "fiatRates"}
 
 // type specific columns
-var cfNamesBitcoinType = []string{"addressBalance", "txAddresses", "blockFilter"}
+var cfNamesBitcoinType = []string{"addressBalance", "txAddresses", "blockFilter", "addressUtxos"}
 var cfNamesEthereumType = []string{"addressContracts", "internalData", "contracts", "functionSignatures", "blockInternalDataErrors", "addressAliases", "ercProtocols"}
+
+// checkForkColumnFamilies verifies that an EXISTING database already carries the
+// fork-specific cfAddressUtxos column family. A database that does not is a
+// stock/v7 one: opening it here would silently create that column family and
+// leave it unreadable by a stock blockbook, so bail out instead. A brand new
+// (empty) database lists no column families and is created normally.
+func checkForkColumnFamilies(path string, c *grocksdb.Cache, openFiles int) error {
+	opts := createAndSetDBOptions(0, c, openFiles)
+	existing, err := grocksdb.ListColumnFamilies(opts, path)
+	if err != nil || len(existing) == 0 {
+		// no database there yet (or it cannot be inspected) - let openDB decide
+		return nil
+	}
+	const wanted = "addressUtxos"
+	for _, n := range existing {
+		if n == wanted {
+			return nil
+		}
+	}
+	return errors.Errorf("database at %s has no %q column family, so it was not created by this build (found: %v). Refusing to open it: doing so would add that column family and make the database unreadable by a stock blockbook. Wipe the data directory and resync, or restore a database created by this build.", path, wanted, existing)
+}
 
 func openDB(path string, c *grocksdb.Cache, openFiles int) (*grocksdb.DB, []*grocksdb.ColumnFamilyHandle, error) {
 	// opts with bloom filter
@@ -174,6 +203,19 @@ func NewRocksDB(path string, cacheSize, maxOpenFiles int, parser bchain.BlockCha
 	}
 
 	c := grocksdb.NewLRUCache(uint64(cacheSize))
+	// Refuse to touch a database that was not created by this build.
+	//
+	// openDB runs with SetCreateIfMissingColumnFamilies(true), so simply opening
+	// a stock (non-fork) database ADDS the addressUtxos column family to it. The
+	// version check that rejects such a database happens much later, by which
+	// point the damage is done: a stock blockbook can no longer open it at all
+	// ("Column families not opened: addressUtxos"). Detect the mismatch here,
+	// before the open, while the database is still untouched.
+	if chainType == bchain.ChainBitcoinType {
+		if err := checkForkColumnFamilies(path, c, maxOpenFiles); err != nil {
+			return nil, err
+		}
+	}
 	db, cfh, err := openDB(path, c, maxOpenFiles)
 	if err != nil {
 		return nil, err
@@ -230,6 +272,52 @@ func NewRocksDB(path string, cacheSize, maxOpenFiles int, parser bchain.BlockCha
 		go r.periodicStoreAddrContractsCache()
 	}
 	return r, nil
+}
+
+// CleanupBlacklistedBalances deletes the addressBalance row of every address in
+// dogeTestnetBlacklist on startup. This collapses 2GB-per-row blobs that come
+// from prior runs (before this address was blacklisted). Safe no-op when the
+// blacklist is empty or rows are already absent.
+// MUST be called only after the DB version check has passed. It writes to the
+// DB, so running it from NewRocksDB (i.e. before the check) silently destroys
+// rows of an incompatible database that we are about to refuse to open.
+func (d *RocksDB) CleanupBlacklistedBalances() error {
+	if d.chainParser.GetChainType() != bchain.ChainBitcoinType {
+		return nil
+	}
+	if len(dogeTestnetBlacklist) == 0 {
+		return nil
+	}
+	wb := grocksdb.NewWriteBatch()
+	defer wb.Destroy()
+	deleted := 0
+	for addrDescStr := range dogeTestnetBlacklist {
+		addrDesc := []byte(addrDescStr)
+		val, err := d.db.GetCF(d.ro, d.cfh[cfAddressBalance], addrDesc)
+		if err != nil {
+			glog.Warningf("rocksdb: cleanupBlacklistedBalances Get error for %x: %v", addrDesc, err)
+			continue
+		}
+		sz := 0
+		if val.Data() != nil {
+			sz = val.Size()
+		}
+		val.Free()
+		if sz == 0 {
+			continue
+		}
+		wb.DeleteCF(d.cfh[cfAddressBalance], addrDesc)
+		glog.Infof("rocksdb: cleanupBlacklistedBalances: deleting addrDesc=%x (was %d bytes)", addrDesc, sz)
+		deleted++
+	}
+	if deleted == 0 {
+		return nil
+	}
+	if err := d.db.Write(d.wo, wb); err != nil {
+		return err
+	}
+	glog.Infof("rocksdb: cleanupBlacklistedBalances: deleted %d blacklisted entries", deleted)
+	return nil
 }
 
 func (d *RocksDB) closeDB() error {
@@ -421,6 +509,31 @@ func (d *RocksDB) ReorgGeneration() uint64 {
 	return d.reorgGen.Load()
 }
 
+// dogeTestnetBlacklist holds addrDesc bytes of addresses whose UTXO sets are
+// too large to index efficiently on Dogecoin testnet. Each such address produces
+// ~2GB per-balance rocksdb writes that stall compaction and the indexer.
+// Addresses listed here are silently skipped during processAddressesBitcoinType
+// and disconnect paths. Existing balance rows are wiped on startup.
+//
+//	njyMWWyh1L7tSX6QkWRgetMVCVyVtfoDta : 46.3M Txs / 46.3M Utxos / ~2GB blob
+//	nb1e3xMbNHeFy4QmbTerm5SYxgzvyyroUL : 220K Txs / 218K Utxos / ~9MB blob
+var dogeTestnetBlacklist = map[string]bool{
+	string([]byte{0x76, 0xa9, 0x14, 0xad, 0x15, 0xfe, 0x0e, 0xef, 0x61, 0x4f, 0x06, 0x00, 0xc7, 0x85, 0x68, 0xd4, 0xa9, 0x1e, 0xde, 0x27, 0xb1, 0x9e, 0x51, 0x88, 0xac}): true,
+	string([]byte{0x76, 0xa9, 0x14, 0x4a, 0xcb, 0x80, 0x39, 0x3d, 0x89, 0x8e, 0xb3, 0x2f, 0xa9, 0xf2, 0xf1, 0x75, 0x98, 0xe0, 0xd8, 0x62, 0xc2, 0x00, 0x5d, 0x88, 0xac}): true,
+}
+
+// isAddrDescIndexable wraps the parser's IsAddrDescIndexable with the blacklist.
+// All connect/disconnect paths must use this instead of calling the parser directly.
+func (d *RocksDB) isAddrDescIndexable(addrDesc bchain.AddressDescriptor) bool {
+	if !d.chainParser.IsAddrDescIndexable(addrDesc) {
+		return false
+	}
+	if dogeTestnetBlacklist[string(addrDesc)] {
+		return false
+	}
+	return true
+}
+
 // ConnectBlock indexes addresses in the block and stores them in db
 func (d *RocksDB) ConnectBlock(block *bchain.Block) error {
 	d.connectBlockMux.Lock()
@@ -605,13 +718,33 @@ type Utxo struct {
 	ValueSat big.Int
 }
 
-// AddrBalance stores number of transactions and balances of an address
+// AddrBalance stores number of transactions and balances of an address.
+//
+// As of dbVersion 8, the Utxos slice holds ONLY the delta of UTXOs touched in
+// the current write batch (outputs created here, plus on-disconnect re-adds).
+// UTXOs spent here that already lived on disk in cfAddressUtxos are recorded
+// in UtxosToDelete instead of mutating the in-memory slice. Historical UTXOs
+// are NOT loaded into memory — that is what kept causing 2GB-blob writes for
+// faucet-spammed addresses on doge testnet (46M UTXOs on a single address).
+//
+// At storeBalances time:
+//   - aggregates (Txs, BalanceSat, SentSat) are written to cfAddressBalance
+//   - each Utxo with Vout >= 0 is written as one key in cfAddressUtxos
+//   - each entry in UtxosToDelete is removed from cfAddressUtxos
 type AddrBalance struct {
-	Txs        uint32
-	SentSat    big.Int
-	BalanceSat big.Int
-	Utxos      []Utxo
-	utxosMap   map[string]int
+	Txs           uint32
+	SentSat       big.Int
+	BalanceSat    big.Int
+	Utxos         []Utxo
+	UtxosToDelete []utxoOutpoint // historical utxos to delete from cfAddressUtxos at flush time
+	utxosMap      map[string]int
+}
+
+// utxoOutpoint is the (btxID, vout) pair identifying a UTXO. Used to enqueue
+// deletes of UTXOs that were created in a previous batch (live on disk).
+type utxoOutpoint struct {
+	BtxID []byte
+	Vout  int32
 }
 
 // ReceivedSat computes received amount from total balance and sent amount
@@ -683,15 +816,17 @@ func (ab *AddrBalance) addUtxoInDisconnect(u *Utxo) {
 	ab.manageUtxoMap(u)
 }
 
-// markUtxoAsSpent finds outpoint btxID:vout in utxos and marks it as spent
-// for small number of utxos the linear search is done, for larger number there is a hashmap index
-// it is much faster than removing the utxo from the slice as it would cause in memory reallocations
+// markUtxoAsSpent finds outpoint btxID:vout in the in-memory delta (utxos
+// added in the current write batch) and marks it as spent (Vout=-1). If the
+// outpoint is not in the delta, it must live on disk in cfAddressUtxos from a
+// previous batch — we enqueue it to UtxosToDelete so storeBalances will
+// DeleteCF it when flushing. No glog.Errorf for "not found" because under
+// the v8 schema the in-memory slice intentionally does NOT load history.
 func (ab *AddrBalance) markUtxoAsSpent(btxID []byte, vout int32) {
 	if len(ab.utxosMap) == 0 {
 		for i := range ab.Utxos {
 			utxo := &ab.Utxos[i]
 			if utxo.Vout == vout && *(*int)(unsafe.Pointer(&utxo.BtxID[0])) == *(*int)(unsafe.Pointer(&btxID[0])) && bytes.Equal(utxo.BtxID, btxID) {
-				// mark utxo as spent by setting vout=-1
 				utxo.Vout = -1
 				return
 			}
@@ -703,7 +838,6 @@ func (ab *AddrBalance) markUtxoAsSpent(btxID []byte, vout int32) {
 				utxo := &ab.Utxos[i]
 				if utxo.Vout == vout {
 					if bytes.Equal(utxo.BtxID, btxID) {
-						// mark utxo as spent by setting vout=-1
 						utxo.Vout = -1
 						return
 					}
@@ -712,7 +846,9 @@ func (ab *AddrBalance) markUtxoAsSpent(btxID []byte, vout int32) {
 			}
 		}
 	}
-	glog.Errorf("Utxo %s:%d not found, utxosMap size %d", hex.EncodeToString(btxID), vout, len(ab.utxosMap))
+	// Not in current delta — must be a historical UTXO living in cfAddressUtxos.
+	// Enqueue a delete; storeBalances applies it.
+	ab.UtxosToDelete = append(ab.UtxosToDelete, utxoOutpoint{BtxID: append([]byte(nil), btxID...), Vout: vout})
 }
 
 type blockTxs struct {
@@ -779,11 +915,11 @@ func (d *RocksDB) processAddressesBitcoinType(block *bchain.Block, addresses add
 				gf.AddAddrDesc(addrDesc, tx)
 			}
 			tao.AddrDesc = addrDesc
-			if d.chainParser.IsAddrDescIndexable(addrDesc) {
+			if d.isAddrDescIndexable(addrDesc) {
 				strAddrDesc := string(addrDesc)
 				balance, e := balances[strAddrDesc]
 				if !e {
-					balance, err = d.GetAddrDescBalance(addrDesc, addressBalanceDetailUTXOIndexed)
+					balance, err = d.GetAddrDescBalance(addrDesc, AddressBalanceDetailNoUTXO)
 					if err != nil {
 						return err
 					}
@@ -873,11 +1009,11 @@ func (d *RocksDB) processAddressesBitcoinType(block *bchain.Block, addresses add
 				}
 				continue
 			}
-			if d.chainParser.IsAddrDescIndexable(spentOutput.AddrDesc) {
+			if d.isAddrDescIndexable(spentOutput.AddrDesc) {
 				strAddrDesc := string(spentOutput.AddrDesc)
 				balance, e := balances[strAddrDesc]
 				if !e {
-					balance, err = d.GetAddrDescBalance(spentOutput.AddrDesc, addressBalanceDetailUTXOIndexed)
+					balance, err = d.GetAddrDescBalance(spentOutput.AddrDesc, AddressBalanceDetailNoUTXO)
 					if err != nil {
 						return err
 					}
@@ -966,17 +1102,43 @@ func (d *RocksDB) storeTxAddresses(wb *grocksdb.WriteBatch, am map[string]*TxAdd
 	return nil
 }
 
+// storeBalances writes the v8 split-schema view of balances to wb:
+//   - aggregate row per address in cfAddressBalance
+//   - per-UTXO key in cfAddressUtxos for new outputs (Vout >= 0 in delta)
+//   - DeleteCF in cfAddressUtxos for spends of historical UTXOs (UtxosToDelete)
+//
+// When Txs drops to 0 (disconnect path collapses an address to nothing) the
+// aggregate row is deleted; cfAddressUtxos entries for that address must be
+// cleaned by the caller (storeBalancesDisconnect handles that).
 func (d *RocksDB) storeBalances(wb *grocksdb.WriteBatch, abm map[string]*AddrBalance) error {
-	// allocate buffer initial buffer
 	buf := make([]byte, 1024)
 	varBuf := make([]byte, maxPackedBigintBytes)
 	for addrDesc, ab := range abm {
-		// balance with 0 transactions is removed from db - happens on disconnect
+		addrDescBytes := bchain.AddressDescriptor(addrDesc)
 		if ab == nil || ab.Txs <= 0 {
-			wb.DeleteCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc))
-		} else {
-			buf = packAddrBalance(ab, buf, varBuf)
-			wb.PutCF(d.cfh[cfAddressBalance], bchain.AddressDescriptor(addrDesc), buf)
+			wb.DeleteCF(d.cfh[cfAddressBalance], addrDescBytes)
+			// best-effort: clean any pending delta for this addr too
+			for _, u := range ab.Utxos {
+				if u.Vout >= 0 {
+					wb.DeleteCF(d.cfh[cfAddressUtxos], packUtxoKey(addrDescBytes, u.BtxID, u.Vout))
+				}
+			}
+			continue
+		}
+		buf = packAddrBalance(ab, buf, varBuf)
+		wb.PutCF(d.cfh[cfAddressBalance], addrDescBytes, buf)
+		// write delta UTXOs (outputs created in this batch and not also spent here)
+		for _, u := range ab.Utxos {
+			if u.Vout < 0 {
+				continue // spent within this same batch — never persisted
+			}
+			key := packUtxoKey(addrDescBytes, u.BtxID, u.Vout)
+			val := packUtxoValue(u.Height, &u.ValueSat, varBuf)
+			wb.PutCF(d.cfh[cfAddressUtxos], key, val)
+		}
+		// delete UTXOs spent in this batch that lived on disk from prior batches
+		for _, op := range ab.UtxosToDelete {
+			wb.DeleteCF(d.cfh[cfAddressUtxos], packUtxoKey(addrDescBytes, op.BtxID, op.Vout))
 		}
 	}
 	return nil
@@ -1070,7 +1232,12 @@ func (d *RocksDB) getBlockTxs(height uint32) ([]blockTxs, error) {
 	return bt, nil
 }
 
-// GetAddrDescBalance returns AddrBalance for given addrDesc
+// GetAddrDescBalance returns AddrBalance for given addrDesc.
+// Under the v8 split schema, the aggregate row lives in cfAddressBalance and
+// UTXOs (when requested) come from a prefix-iterator scan of cfAddressUtxos.
+// Callers that only need balance/Txs aggregates MUST pass
+// AddressBalanceDetailNoUTXO to skip the UTXO scan, otherwise an address with
+// millions of UTXOs (testnet faucets) will read all of them.
 func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor, detail AddressBalanceDetail) (*AddrBalance, error) {
 	val, err := d.db.GetCF(d.ro, d.cfh[cfAddressBalance], addrDesc)
 	if err != nil {
@@ -1078,11 +1245,71 @@ func (d *RocksDB) GetAddrDescBalance(addrDesc bchain.AddressDescriptor, detail A
 	}
 	defer val.Free()
 	buf := val.Data()
-	// 3 is minimum length of addrBalance - 1 byte txs, 1 byte sent, 1 byte balance
 	if len(buf) < 3 {
 		return nil, nil
 	}
-	return unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), detail)
+	ab, err := unpackAddrBalance(buf, d.chainParser.PackedTxidLen(), detail)
+	if err != nil || ab == nil {
+		return ab, err
+	}
+	if detail == AddressBalanceDetailNoUTXO {
+		return ab, nil
+	}
+	// load UTXOs from cfAddressUtxos via prefix iterator
+	utxos, err := d.getAddrUtxosFromColumn(addrDesc, detail)
+	if err != nil {
+		return nil, err
+	}
+	ab.Utxos = utxos
+	if detail == addressBalanceDetailUTXOIndexed && len(utxos) >= 16 {
+		ab.utxosMap = make(map[string]int, len(utxos)+8)
+		for i := range utxos {
+			s := string(utxos[i].BtxID)
+			if _, e := ab.utxosMap[s]; !e {
+				ab.utxosMap[s] = i
+			}
+		}
+	}
+	return ab, nil
+}
+
+// getAddrUtxosFromColumn iterates cfAddressUtxos with prefix=len|addrDesc and
+// returns all UTXOs of that address. Returns nil slice (not error) for
+// unknown addresses.
+func (d *RocksDB) getAddrUtxosFromColumn(addrDesc bchain.AddressDescriptor, detail AddressBalanceDetail) ([]Utxo, error) {
+	prefix := packUtxoKeyPrefix(addrDesc)
+	it := d.db.NewIteratorCF(d.ro, d.cfh[cfAddressUtxos])
+	defer it.Close()
+	var utxos []Utxo
+	txidLen := d.chainParser.PackedTxidLen()
+	_ = detail
+	for it.Seek(prefix); it.Valid(); it.Next() {
+		k := it.Key().Data()
+		if !bytes.HasPrefix(k, prefix) {
+			break
+		}
+		btxID, vout, ok := unpackUtxoKey(k, txidLen)
+		v := it.Value().Data()
+		if ok && len(v) > 0 {
+			h, value := unpackUtxoValue(v)
+			utxos = append(utxos, Utxo{
+				BtxID:    btxID,
+				Vout:     vout,
+				Height:   h,
+				ValueSat: value,
+			})
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	// cfAddressUtxos is keyed by (addrDesc, btxID, vout), so the iterator yields
+	// UTXOs in txid-byte order. The API layer (getAddrDescUtxo) walks the slice
+	// backwards to return "newest first" and therefore depends on the v7
+	// invariant of ascending height ordering — restore it here, otherwise
+	// /api/v2/utxo returns an effectively random order.
+	sort.SliceStable(utxos, func(i, j int) bool { return utxos[i].Height < utxos[j].Height })
+	return utxos, nil
 }
 
 // GetAddressBalance returns address balance for an address or nil if address not found
@@ -1262,45 +1489,27 @@ func (d *RocksDB) appendTxOutput(txo *TxOutput, buf []byte, varBuf []byte) []byt
 	return buf
 }
 
+// unpackAddrBalance unpacks the aggregate-only AddrBalance row from
+// cfAddressBalance (v8 schema). UTXOs live in a separate column family
+// (cfAddressUtxos) and are loaded by GetAddrDescBalance when requested.
+// The detail / txidUnpackedLen parameters are kept for API stability with
+// older code paths that may still pass them.
 func unpackAddrBalance(buf []byte, txidUnpackedLen int, detail AddressBalanceDetail) (*AddrBalance, error) {
 	txs, l := unpackVaruint(buf)
 	sentSat, sl := unpackBigint(buf[l:])
 	balanceSat, bl := unpackBigint(buf[l+sl:])
-	l = l + sl + bl
-	ab := &AddrBalance{
+	_ = txidUnpackedLen
+	_ = detail
+	_ = bl
+	return &AddrBalance{
 		Txs:        uint32(txs),
 		SentSat:    sentSat,
 		BalanceSat: balanceSat,
-	}
-	if detail != AddressBalanceDetailNoUTXO {
-		// estimate the size of utxos to avoid reallocation
-		ab.Utxos = make([]Utxo, 0, len(buf[l:])/txidUnpackedLen+3)
-		// ab.utxosMap = make(map[string]int, cap(ab.Utxos))
-		for len(buf[l:]) >= txidUnpackedLen+3 {
-			btxID := append([]byte(nil), buf[l:l+txidUnpackedLen]...)
-			l += txidUnpackedLen
-			vout, ll := unpackVaruint(buf[l:])
-			l += ll
-			height, ll := unpackVaruint(buf[l:])
-			l += ll
-			valueSat, ll := unpackBigint(buf[l:])
-			l += ll
-			u := Utxo{
-				BtxID:    btxID,
-				Vout:     int32(vout),
-				Height:   uint32(height),
-				ValueSat: valueSat,
-			}
-			if detail == AddressBalanceDetailUTXO {
-				ab.Utxos = append(ab.Utxos, u)
-			} else {
-				ab.addUtxo(&u)
-			}
-		}
-	}
-	return ab, nil
+	}, nil
 }
 
+// packAddrBalance packs the aggregate-only AddrBalance row (v8 schema).
+// UTXOs are written to cfAddressUtxos as separate keys, not inlined here.
 func packAddrBalance(ab *AddrBalance, buf, varBuf []byte) []byte {
 	buf = buf[:0]
 	l := packVaruint(uint(ab.Txs), varBuf)
@@ -1309,19 +1518,96 @@ func packAddrBalance(ab *AddrBalance, buf, varBuf []byte) []byte {
 	buf = append(buf, varBuf[:l]...)
 	l = packBigint(&ab.BalanceSat, varBuf)
 	buf = append(buf, varBuf[:l]...)
-	for _, utxo := range ab.Utxos {
-		// if Vout < 0, utxo is marked as spent and removed from the entry
-		if utxo.Vout >= 0 {
-			buf = append(buf, utxo.BtxID...)
-			l = packVaruint(uint(utxo.Vout), varBuf)
-			buf = append(buf, varBuf[:l]...)
-			l = packVaruint(uint(utxo.Height), varBuf)
-			buf = append(buf, varBuf[:l]...)
-			l = packBigint(&utxo.ValueSat, varBuf)
-			buf = append(buf, varBuf[:l]...)
-		}
-	}
 	return buf
+}
+
+// packUtxoKey returns the cfAddressUtxos key:
+//
+//	1 byte length-of-addrDesc | addrDesc | btxID (fixed PackedTxidLen) | varint(vout)
+//
+// Length-prefixing the addrDesc lets us iterate all UTXOs of one address by
+// seeking to the prefix `lenByte | addrDesc`. (addrDesc itself is not
+// fixed-length across address types, so a delimiter alone wouldn't be safe.)
+func packUtxoKey(addrDesc bchain.AddressDescriptor, btxID []byte, vout int32) []byte {
+	if len(addrDesc) > 255 {
+		// addrDesc is bounded by maxAddrDescLen=1024 conceptually but in practice
+		// stays well under 100 bytes; if we ever see >255 we fall back to a 2-byte
+		// length prefix by reserving 0xFF as escape.
+		out := make([]byte, 0, 3+len(addrDesc)+len(btxID)+5)
+		out = append(out, 0xFF, byte(len(addrDesc)>>8), byte(len(addrDesc)))
+		out = append(out, addrDesc...)
+		out = append(out, btxID...)
+		var vb [vlq.MaxLen64]byte
+		n := packVaruint(uint(vout), vb[:])
+		out = append(out, vb[:n]...)
+		return out
+	}
+	out := make([]byte, 0, 1+len(addrDesc)+len(btxID)+5)
+	out = append(out, byte(len(addrDesc)))
+	out = append(out, addrDesc...)
+	out = append(out, btxID...)
+	var vb [vlq.MaxLen64]byte
+	n := packVaruint(uint(vout), vb[:])
+	out = append(out, vb[:n]...)
+	return out
+}
+
+// packUtxoKeyPrefix returns just the address-prefix part of packUtxoKey,
+// suitable for an iterator Seek + prefix-match loop.
+func packUtxoKeyPrefix(addrDesc bchain.AddressDescriptor) []byte {
+	if len(addrDesc) > 255 {
+		out := make([]byte, 0, 3+len(addrDesc))
+		out = append(out, 0xFF, byte(len(addrDesc)>>8), byte(len(addrDesc)))
+		out = append(out, addrDesc...)
+		return out
+	}
+	out := make([]byte, 0, 1+len(addrDesc))
+	out = append(out, byte(len(addrDesc)))
+	out = append(out, addrDesc...)
+	return out
+}
+
+// unpackUtxoKey is the inverse of packUtxoKey. Returns btxID and vout (the
+// addrDesc is implicit from the iterator prefix and not returned).
+func unpackUtxoKey(key []byte, txidUnpackedLen int) (btxID []byte, vout int32, ok bool) {
+	if len(key) < 1 {
+		return nil, 0, false
+	}
+	var addrDescLen int
+	var off int
+	if key[0] == 0xFF {
+		if len(key) < 3 {
+			return nil, 0, false
+		}
+		addrDescLen = int(key[1])<<8 | int(key[2])
+		off = 3
+	} else {
+		addrDescLen = int(key[0])
+		off = 1
+	}
+	if len(key) < off+addrDescLen+txidUnpackedLen+1 {
+		return nil, 0, false
+	}
+	btxID = append([]byte(nil), key[off+addrDescLen:off+addrDescLen+txidUnpackedLen]...)
+	v, _ := unpackVaruint(key[off+addrDescLen+txidUnpackedLen:])
+	return btxID, int32(v), true
+}
+
+// packUtxoValue returns the cfAddressUtxos value: varint(height) | varintBig(valueSat).
+func packUtxoValue(height uint32, valueSat *big.Int, varBuf []byte) []byte {
+	var buf []byte
+	n := packVaruint(uint(height), varBuf)
+	buf = append(buf, varBuf[:n]...)
+	n = packBigint(valueSat, varBuf)
+	buf = append(buf, varBuf[:n]...)
+	return buf
+}
+
+// unpackUtxoValue parses the cfAddressUtxos value into (height, valueSat).
+func unpackUtxoValue(val []byte) (uint32, big.Int) {
+	h, l := unpackVaruint(val)
+	v, _ := unpackBigint(val[l:])
+	return uint32(h), v
 }
 
 func (d *RocksDB) unpackTxAddresses(buf []byte) (*TxAddresses, error) {
@@ -1720,7 +2006,7 @@ func (d *RocksDB) disconnectTxAddressesInputs(wb *grocksdb.WriteBatch, btxID []b
 				sa.Outputs[input.index].Spent = false
 				inputHeight = sa.Height
 			}
-			if d.chainParser.IsAddrDescIndexable(t.AddrDesc) {
+			if d.isAddrDescIndexable(t.AddrDesc) {
 				balance, err = getAddressBalance(t.AddrDesc)
 				if err != nil {
 					return err
@@ -1757,7 +2043,7 @@ func (d *RocksDB) disconnectTxAddressesOutputs(wb *grocksdb.WriteBatch, btxID []
 	for i, t := range txa.Outputs {
 		if len(t.AddrDesc) > 0 {
 			exist := addressFoundInTx(t.AddrDesc, btxID)
-			if d.chainParser.IsAddrDescIndexable(t.AddrDesc) {
+			if d.isAddrDescIndexable(t.AddrDesc) {
 				balance, err := getAddressBalance(t.AddrDesc)
 				if err != nil {
 					return err
@@ -1808,7 +2094,10 @@ func (d *RocksDB) disconnectBlock(height uint32, blockTxs []blockTxs) error {
 		s := string(addrDesc)
 		b, fb := balances[s]
 		if !fb {
-			b, err = d.GetAddrDescBalance(addrDesc, addressBalanceDetailUTXOIndexed)
+			// v8 schema: load aggregate only — Utxos slice will be used as a
+			// per-disconnect delta (re-added by addUtxoInDisconnect, removed
+			// by markUtxoAsSpent → UtxosToDelete) and flushed via storeBalances.
+			b, err = d.GetAddrDescBalance(addrDesc, AddressBalanceDetailNoUTXO)
 			if err != nil {
 				return nil, err
 			}
@@ -1911,26 +2200,14 @@ func (d *RocksDB) DisconnectBlockRangeBitcoinType(lower uint32, higher uint32) e
 	return nil
 }
 
+// storeBalancesDisconnect under the v8 split schema is a thin wrapper around
+// storeBalances. The per-batch Utxos slice carries re-added (un-spent) UTXOs
+// with Vout>=0 and same-batch-spent ones with Vout==-1; UtxosToDelete carries
+// historical UTXOs that need to be removed from cfAddressUtxos. storeBalances
+// translates that into PutCF/DeleteCF correctly. Sorting & filtering is no
+// longer needed because UTXOs are separate keys, not packed into one blob.
 func (d *RocksDB) storeBalancesDisconnect(wb *grocksdb.WriteBatch, balances map[string]*AddrBalance) {
-	for _, b := range balances {
-		if b != nil {
-			// remove spent utxos
-			us := make([]Utxo, 0, len(b.Utxos))
-			for _, u := range b.Utxos {
-				// remove utxos marked as spent
-				if u.Vout >= 0 {
-					us = append(us, u)
-				}
-			}
-			b.Utxos = us
-			// sort utxos by height
-			sort.SliceStable(b.Utxos, func(i, j int) bool {
-				return b.Utxos[i].Height < b.Utxos[j].Height
-			})
-		}
-	}
 	d.storeBalances(wb, balances)
-
 }
 func dirSize(path string) (int64, error) {
 	var size int64
@@ -2491,12 +2768,25 @@ func (d *RocksDB) fixUtxo(addrDesc bchain.AddressDescriptor, ba *AddrBalance) (b
 	return false, reorder, nil
 }
 
-// FixUtxos checks and fixes possible
+// FixUtxos checks and fixes possible inconsistencies in the UTXO index.
+//
+// Under the v8 split schema, UTXOs live in their own cfAddressUtxos column
+// family as separate keys, so the previous in-blob ordering / spent-bit
+// invariants no longer apply. We short-circuit here as a no-op; if a real
+// audit is ever needed it should iterate cfAddressUtxos and reconcile
+// against cfAddressBalance aggregates, but that is not on the hot path.
 func (d *RocksDB) FixUtxos(stop chan os.Signal) error {
 	if d.chainParser.GetChainType() != bchain.ChainBitcoinType {
 		glog.Info("FixUtxos: applicable only for bitcoin type coins")
 		return nil
 	}
+	glog.Info("FixUtxos: skipped (v8 split-utxo schema does not need legacy fix-up)")
+	return nil
+}
+
+// fixUtxosLegacy keeps the original (v7-and-earlier) implementation around
+// only for reference; never called.
+func (d *RocksDB) fixUtxosLegacy(stop chan os.Signal) error {
 	glog.Info("FixUtxos: starting")
 	var row, errorsCount, fixedCount int64
 	var seekKey []byte
