@@ -55,6 +55,7 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/trezarcoin"
 	"github.com/trezor/blockbook/bchain/coins/tron"
 	"github.com/trezor/blockbook/bchain/coins/unobtanium"
+	"github.com/trezor/blockbook/bchain/coins/verge"
 	"github.com/trezor/blockbook/bchain/coins/vertcoin"
 	"github.com/trezor/blockbook/bchain/coins/viacoin"
 	"github.com/trezor/blockbook/bchain/coins/vipstarcoin"
@@ -99,6 +100,7 @@ func init() {
 	BlockChainFactories["Litecoin Testnet"] = litecoin.NewLitecoinRPC
 	BlockChainFactories["Dogecoin"] = dogecoin.NewDogecoinRPC
 	BlockChainFactories["Dogecoin Testnet"] = dogecoin.NewDogecoinRPC
+	BlockChainFactories["Verge"] = verge.NewVergeRPC
 	BlockChainFactories["Vertcoin"] = vertcoin.NewVertcoinRPC
 	BlockChainFactories["Vertcoin Testnet"] = vertcoin.NewVertcoinRPC
 	BlockChainFactories["Namecoin"] = namecoin.NewNamecoinRPC

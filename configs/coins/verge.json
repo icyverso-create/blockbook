@@ -1,0 +1,77 @@
+{
+    "coin": {
+        "name": "Verge",
+        "shortcut": "XVG",
+        "label": "Verge",
+        "alias": "verge"
+    },
+    "ports": {
+        "backend_rpc": 8068,
+        "backend_message_queue": 38368,
+        "blockbook_internal": 9068,
+        "blockbook_public": 9168
+    },
+    "ipc": {
+        "rpc_url_template": "http://127.0.0.1:{{.Ports.BackendRPC}}",
+        "rpc_user": "rpc",
+        "rpc_pass": "rpcp",
+        "rpc_timeout": 25,
+        "message_queue_binding_template": "tcp://127.0.0.1:{{.Ports.BackendMessageQueue}}"
+    },
+    "backend": {
+        "package_name": "backend-verge",
+        "package_revision": "satoshilabs-1",
+        "system_user": "verge",
+        "version": "8.0.3",
+        "binary_url": "https://github.com/vergecurrency/verge/releases/download/v8.0.3/verge-ubuntu22.zip",
+        "verification_type": "sha256",
+        "verification_source": "55fbb72e552810b789cfe298d021e557e568aa0fd4c76b180a74163644528e21",
+        "extract_command": "unzip -j -d backend",
+        "exclude_files": [
+            "verge-qt",
+            "verge-tx"
+        ],
+        "exec_command_template": "{{.Env.BackendInstallPath}}/{{.Coin.Alias}}/verged -datadir={{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend -conf={{.Env.BackendInstallPath}}/{{.Coin.Alias}}/{{.Coin.Alias}}.conf -pid=/run/{{.Coin.Alias}}/{{.Coin.Alias}}.pid",
+        "logrotate_files_template": "{{.Env.BackendDataPath}}/{{.Coin.Alias}}/backend/*.log",
+        "postinst_script_template": "",
+        "service_type": "forking",
+        "service_additional_params_template": "",
+        "protect_memory": true,
+        "mainnet": true,
+        "server_config_file": "bitcoin_like.conf",
+        "client_config_file": "bitcoin_like_client.conf",
+        "additional_params": {
+            "discover": 0,
+            "rpcthreads": 16,
+            "upnp": 0,
+            "whitelist": "127.0.0.1"
+        }
+    },
+    "blockbook": {
+        "package_name": "blockbook-verge",
+        "system_user": "blockbook-verge",
+        "internal_binding_template": ":{{.Ports.BlockbookInternal}}",
+        "public_binding_template": ":{{.Ports.BlockbookPublic}}",
+        "explorer_url": "",
+        "additional_params": "",
+        "block_chain": {
+            "parse": false,
+            "mempool_workers": 8,
+            "mempool_sub_workers": 2,
+            "block_addresses_to_keep": 300,
+            "xpub_magic": 36513075,
+            "xpub_magic_segwit_p2sh": 77429938,
+            "xpub_magic_segwit_native": 78792518,
+            "slip44": 77,
+            "additional_params": {
+                "fiat_rates": "coingecko",
+                "fiat_rates_vs_currencies": "AED,ARS,AUD,BDT,BHD,BMD,BRL,CAD,CHF,CLP,CNY,CZK,DKK,EUR,GBP,HKD,HUF,IDR,ILS,INR,JPY,KRW,KWD,LKR,MMK,MXN,MYR,NGN,NOK,NZD,PHP,PKR,PLN,RUB,SAR,SEK,SGD,THB,TRY,TWD,UAH,USD,VEF,VND,ZAR,BTC,ETH",
+                "fiat_rates_params": "{\"coin\": \"verge\", \"periodSeconds\": 900}"
+            }
+        }
+    },
+    "meta": {
+        "package_maintainer": "IT Admin",
+        "package_maintainer_email": "it@satoshilabs.com"
+    }
+}
