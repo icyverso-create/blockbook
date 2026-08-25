@@ -58,6 +58,7 @@ var (
 	prof        = flag.String("prof", "", "http server binding [address]:port of the interface to profiling data /debug/pprof/ (default no profiling)")
 
 	syncChunk   = flag.Int("chunk", 100, "block chunk size for processing in bulk mode")
+	memLimitGB  = flag.Float64("memlimit", 0, "soft memory limit in GB (Go GOMEMLIMIT); 0 disables it")
 	syncWorkers = flag.Int("workers", 8, "number of workers to process blocks in bulk mode")
 	dryRun      = flag.Bool("dryrun", false, "do not index blocks, only download")
 
@@ -137,6 +138,17 @@ func mainWithExitCode() int {
 	flag.Parse()
 
 	defer glog.Flush()
+
+	// A soft memory limit makes the GC work harder as the heap approaches it,
+	// instead of letting RSS follow the GOGC=100 "double the live set" pacing.
+	// Chains whose individual blocks are gigabytes need this: the transient
+	// garbage of one block can otherwise push RSS far past what is resident.
+	// Trading throughput for a bounded footprint is deliberate.
+	if *memLimitGB > 0 {
+		limit := int64(*memLimitGB * (1 << 30))
+		debug.SetMemoryLimit(limit)
+		glog.Infof("memory: GOMEMLIMIT set to %.2f GB", *memLimitGB)
+	}
 
 	rand.Seed(time.Now().UTC().UnixNano())
 

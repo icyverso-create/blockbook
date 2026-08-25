@@ -246,7 +246,26 @@ func (w *SyncWorker) ResyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 	return err
 }
 
+// maxResyncDepth bounds how many times a sync pass may restart itself before we
+// give up. Each restart is a tail call, and Go does not eliminate those, so an
+// unproductive cycle grows the stack while making no progress at all: the
+// symptom is a sync that looks alive and never advances. The known trigger is a
+// block the backend cannot deliver within MaxStallDuration - which yields
+// errResync, which restarts the pass, which asks for the same block again.
+// Failing loudly after a bounded number of restarts is far better than that.
+const maxResyncDepth = 32
+
 func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync bool) error {
+	return w.resyncIndexAtDepth(onNewBlock, initialSync, 0)
+}
+
+func (w *SyncWorker) resyncIndexAtDepth(onNewBlock bchain.OnNewBlockFunc, initialSync bool, depth int) error {
+	if depth >= maxResyncDepth {
+		return errors.Errorf("resync restarted %d times without finishing; giving up. "+
+			"The usual cause is a block the backend cannot deliver inside the stall budget "+
+			"(check rpc_timeout and missingBlockRetry.maxStallMs against how long the backend "+
+			"actually takes for the largest blocks)", depth)
+	}
 	remoteBestHash, err := w.chain.GetBestBlockHash()
 	if err != nil {
 		return err
@@ -269,7 +288,7 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 		if remoteHash != localBestHash {
 			// forked - the remote hash differs from the local hash at the same height
 			glog.Info("resync: local is forked at height ", localBestHeight, ", local hash ", localBestHash, ", remote hash ", remoteHash)
-			return w.handleFork(localBestHeight, localBestHash, onNewBlock, initialSync)
+			return w.handleFork(localBestHeight, localBestHash, onNewBlock, initialSync, depth)
 		}
 		w.startHeight = localBestHeight + 1
 	} else {
@@ -301,13 +320,13 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 					if err != nil {
 						if stdErrors.Is(err, errResync) {
 							// block hash changed during parallel sync, restart the full resync
-							return w.resyncIndex(onNewBlock, initialSync)
+							return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 						}
 						return err
 					}
 					// after parallel load finish the sync using standard way,
 					// new blocks may have been created in the meantime
-					return w.resyncIndex(onNewBlock, initialSync)
+					return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 				}
 			}
 			if w.chain.GetChainParser().GetChainType() == bchain.ChainEthereumType {
@@ -320,25 +339,25 @@ func (w *SyncWorker) resyncIndex(onNewBlock bchain.OnNewBlockFunc, initialSync b
 					if err != nil {
 						if stdErrors.Is(err, errResync) {
 							// block hash changed during parallel sync, restart the full resync
-							return w.resyncIndex(onNewBlock, initialSync)
+							return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 						}
 						return err
 					}
 					// after parallel load finish the sync using standard way,
 					// new blocks may have been created in the meantime
-					return w.resyncIndex(onNewBlock, initialSync)
+					return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 				}
 			}
 		}
 	}
 	err = w.connectBlocks(onNewBlock, initialSync)
 	if stdErrors.Is(err, errFork) || stdErrors.Is(err, errResync) {
-		return w.resyncIndex(onNewBlock, initialSync)
+		return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 	}
 	return err
 }
 
-func (w *SyncWorker) handleFork(localBestHeight uint32, localBestHash string, onNewBlock bchain.OnNewBlockFunc, initialSync bool) error {
+func (w *SyncWorker) handleFork(localBestHeight uint32, localBestHash string, onNewBlock bchain.OnNewBlockFunc, initialSync bool, depth int) error {
 	// find forked blocks, disconnect them and then synchronize again
 	var height uint32
 	hashes := []string{localBestHash}
@@ -372,7 +391,7 @@ func (w *SyncWorker) handleFork(localBestHeight uint32, localBestHash string, on
 	if err := w.DisconnectBlocks(height+1, localBestHeight, hashes); err != nil {
 		return err
 	}
-	return w.resyncIndex(onNewBlock, initialSync)
+	return w.resyncIndexAtDepth(onNewBlock, initialSync, depth+1)
 }
 
 func (w *SyncWorker) connectBlocks(onNewBlock bchain.OnNewBlockFunc, initialSync bool) error {
