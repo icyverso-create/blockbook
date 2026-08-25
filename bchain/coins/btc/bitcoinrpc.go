@@ -126,6 +126,22 @@ type Configuration struct {
 	// holds the old and the new buffer at the same time - 1.5x the block size
 	// in transient garbage, which is gigabytes on Bitcoin SV.
 	BlockSizeHintFromHeader bool `json:"block_size_hint_from_header,omitempty"`
+	// BlockPrefetch overrides how many fetched-but-not-yet-connected blocks the
+	// sequential sync path keeps in flight. 0 keeps the stock depth of 8.
+	//
+	// This is NOT the same knob as -workers, which only gates the bulk/parallel
+	// paths - -workers=1 forces the sequential path, where this is the only
+	// bound on how much block data is resident at once.
+	BlockPrefetch int `json:"block_prefetch,omitempty"`
+}
+
+// BlockPrefetchOverride implements the optional interface blockbook.go probes
+// for; returning 0 means "keep the default".
+func (b *BitcoinRPC) BlockPrefetchOverride() int {
+	if b.ChainConfig == nil {
+		return 0
+	}
+	return b.ChainConfig.BlockPrefetch
 }
 
 // AverageBlockTimeDuration returns AverageBlockTimeMs as a time.Duration.

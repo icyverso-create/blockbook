@@ -29,6 +29,7 @@ type SyncWorker struct {
 	startHash              string
 	chanOsSignal           chan os.Signal
 	missingBlockRetry      MissingBlockRetryConfig
+	blockPrefetch          int
 	metrics                *common.Metrics
 	is                     *common.InternalState
 }
@@ -54,7 +55,19 @@ type MissingBlockRetryConfig struct {
 // SyncWorkerConfig bundles optional tuning knobs for SyncWorker.
 type SyncWorkerConfig struct {
 	MissingBlockRetry MissingBlockRetryConfig
+	// BlockPrefetch is how many fetched-but-not-yet-connected blocks the
+	// sequential sync path keeps in flight. Note this is independent of
+	// -workers: -workers only gates the bulk/parallel paths, and setting it to 1
+	// actually forces the sequential path, where this buffer is the only thing
+	// bounding memory. One in-flight block costs roughly its own size several
+	// times over, so on chains with multi-gigabyte blocks the stock depth of 8
+	// is the difference between a few GB and OOM.
+	BlockPrefetch int
 }
+
+// defaultBlockPrefetch is the stock depth, kept as-is for every chain that does
+// not override it.
+const defaultBlockPrefetch = 8
 
 // DefaultMissingBlockRetryConfig returns the built-in defaults used when no
 // per-chain override is supplied. Exported so blockbook.go can overlay
@@ -71,6 +84,7 @@ func DefaultMissingBlockRetryConfig() MissingBlockRetryConfig {
 func defaultSyncWorkerConfig() SyncWorkerConfig {
 	return SyncWorkerConfig{
 		MissingBlockRetry: DefaultMissingBlockRetryConfig(),
+		BlockPrefetch:     defaultBlockPrefetch,
 	}
 }
 
@@ -127,6 +141,11 @@ func NewSyncWorkerWithConfig(db *RocksDB, chain bchain.BlockChain, syncWorkers, 
 	if effectiveCfg.MissingBlockRetry.MaxStallDuration <= 0 {
 		effectiveCfg.MissingBlockRetry.MaxStallDuration = DefaultMissingBlockRetryConfig().MaxStallDuration
 	}
+	// A zero value means "not configured" (a partial cfg from a test or an
+	// omitted config field); a negative one would panic in make(chan, n).
+	if effectiveCfg.BlockPrefetch <= 0 {
+		effectiveCfg.BlockPrefetch = defaultBlockPrefetch
+	}
 	return &SyncWorker{
 		db:                db,
 		chain:             chain,
@@ -136,6 +155,7 @@ func NewSyncWorkerWithConfig(db *RocksDB, chain bchain.BlockChain, syncWorkers, 
 		startHeight:       uint32(minStartHeight),
 		chanOsSignal:      chanOsSignal,
 		missingBlockRetry: effectiveCfg.MissingBlockRetry,
+		blockPrefetch:     effectiveCfg.BlockPrefetch,
 		metrics:           metrics,
 		is:                is,
 	}, nil
@@ -356,7 +376,7 @@ func (w *SyncWorker) handleFork(localBestHeight uint32, localBestHash string, on
 }
 
 func (w *SyncWorker) connectBlocks(onNewBlock bchain.OnNewBlockFunc, initialSync bool) error {
-	bch := make(chan blockResult, 8)
+	bch := make(chan blockResult, w.blockPrefetch)
 	done := make(chan struct{})
 	defer close(done)
 

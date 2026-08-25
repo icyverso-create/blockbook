@@ -299,6 +299,19 @@ func mainWithExitCode() int {
 				syncCfg.MissingBlockRetry.MaxStallDuration)
 		}
 	}
+	// Per-chain block prefetch depth, if any. Only chains with very large blocks
+	// need this; everyone else keeps the stock depth.
+	if provider, ok := chain.(interface {
+		BlockPrefetchOverride() int
+	}); ok {
+		if depth := provider.BlockPrefetchOverride(); depth > 0 {
+			if syncCfg == nil {
+				syncCfg = &db.SyncWorkerConfig{MissingBlockRetry: db.DefaultMissingBlockRetryConfig()}
+			}
+			syncCfg.BlockPrefetch = depth
+			glog.Infof("sync: blockPrefetch override applied: %d blocks in flight", depth)
+		}
+	}
 	syncWorker, err = db.NewSyncWorkerWithConfig(index, chain, *syncWorkers, *syncChunk, *blockFrom, *dryRun, chanOsSignal, metrics, internalState, syncCfg)
 	if err != nil {
 		glog.Errorf("NewSyncWorker %v", err)
