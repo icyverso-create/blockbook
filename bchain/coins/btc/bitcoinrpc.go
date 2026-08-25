@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -113,6 +114,18 @@ type Configuration struct {
 	// XpubConfig overrides the xpub address expansion and cache limits.
 	// All fields are optional; missing fields use built-in defaults.
 	XpubConfig *bchain.XpubConfig `json:"xpubConfig,omitempty"`
+	// BlockSizeHintFromHeader makes the sync path ask getblockheader for the
+	// block size before downloading the block, so the receive buffer is
+	// allocated once at exactly the right size.
+	//
+	// It costs one extra small RPC per block and is pointless on chains with
+	// small blocks, where exponential growth of the buffer is already cheap.
+	// It pays off on big-block chains: the backend answers getblock with
+	// Transfer-Encoding: chunked and no Content-Length, so without a hint the
+	// buffer has to double its way up to the block size, and the last doubling
+	// holds the old and the new buffer at the same time - 1.5x the block size
+	// in transient garbage, which is gigabytes on Bitcoin SV.
+	BlockSizeHintFromHeader bool `json:"block_size_hint_from_header,omitempty"`
 }
 
 // AverageBlockTimeDuration returns AverageBlockTimeMs as a time.Duration.
@@ -698,7 +711,9 @@ func (b *BitcoinRPC) GetBlock(hash string, height uint32) (*bchain.Block, error)
 	if err != nil {
 		return nil, err
 	}
-	data, err := b.GetBlockBytes(hash)
+	// the header already knows the block size, use it to allocate the receive
+	// buffer exactly once
+	data, err := b.GetBlockBytesWithSizeHint(hash, header.Size)
 	if err != nil {
 		return nil, err
 	}
@@ -735,7 +750,15 @@ func (b *BitcoinRPC) GetBlockInfo(hash string) (*bchain.BlockInfo, error) {
 // GetBlockWithoutHeader is an optimization - it does not call GetBlockHeader to get prev, next hashes
 // instead it sets to header only block hash and height passed in parameters
 func (b *BitcoinRPC) GetBlockWithoutHeader(hash string, height uint32) (*bchain.Block, error) {
-	data, err := b.GetBlockBytes(hash)
+	sizeHint := 0
+	if b.ChainConfig != nil && b.ChainConfig.BlockSizeHintFromHeader {
+		// A failure here is not fatal: the hint is an optimization, and the
+		// block download below reports the real error if the backend is down.
+		if header, herr := b.GetBlockHeader(hash); herr == nil {
+			sizeHint = header.Size
+		}
+	}
+	data, err := b.GetBlockBytesWithSizeHint(hash, sizeHint)
 	if err != nil {
 		return nil, err
 	}
@@ -770,13 +793,118 @@ func (b *BitcoinRPC) GetBlockRaw(hash string) (string, error) {
 	return res.Result, nil
 }
 
+// drainOnCloseLimit is how much of an unfinished response body is read before
+// closing it, so that net/http can put the connection back in the pool. The
+// leftover after a successful streamed decode is the tail of the JSON envelope,
+// a few tens of bytes; anything substantially larger means the response was
+// abandoned mid-way and is not worth draining.
+const drainOnCloseLimit = 64 << 10
+
 // GetBlockBytes returns block with given hash as bytes
 func (b *BitcoinRPC) GetBlockBytes(hash string) ([]byte, error) {
-	block, err := b.GetBlockRaw(hash)
+	return b.GetBlockBytesWithSizeHint(hash, 0)
+}
+
+// GetBlockBytesWithSizeHint returns block with given hash as bytes, decoding the
+// hex payload straight from the HTTP response body into a single buffer.
+//
+// Unlike GetBlockRaw it never materializes the JSON body nor the hex string, so
+// the peak allocation is one buffer of the block size instead of 5x the block
+// size. This matters on big-block chains (a 3814 MiB BSV block costs ~19 GiB on
+// the stock path).
+//
+// sizeHint is the expected decoded size in bytes, typically the "size" field of
+// getblockheader; pass 0 when unknown, in which case the Content-Length of the
+// response is used and, failing that, the buffer grows exponentially.
+func (b *BitcoinRPC) GetBlockBytesWithSizeHint(hash string, sizeHint int) ([]byte, error) {
+	glog.V(1).Info("rpc: getblock (verbosity=0, streamed) ", hash)
+
+	req := CmdGetBlock{Method: "getblock"}
+	req.Params.BlockHash = hash
+	req.Params.Verbosity = 0
+
+	data, rpcErr, err := b.callStreamedHex(&req, sizeHint)
 	if err != nil {
-		return nil, err
+		return nil, errors.Annotatef(err, "hash %v", hash)
 	}
-	return hex.DecodeString(block)
+	if rpcErr != nil {
+		if IsErrBlockNotFound(rpcErr) {
+			return nil, bchain.ErrBlockNotFound
+		}
+		return nil, errors.Annotatef(rpcErr, "hash %v", hash)
+	}
+	return data, nil
+}
+
+// callStreamedHex calls the backend the same way as Call does, but decodes the
+// hex string in the "result" member of the response on the fly.
+//
+// It returns either the decoded bytes or the JSON-RPC error reported by the
+// backend; a transport/protocol failure is returned as the third value. Note
+// that, exactly like Call, a non-200 status is not by itself an error - bitcoind
+// replies 500 with a well formed JSON-RPC error body for e.g. an unknown block,
+// and that body is what the caller has to look at.
+func (b *BitcoinRPC) callStreamedHex(req interface{}, sizeHint int) ([]byte, *bchain.RPCError, error) {
+	httpData, err := b.RPCMarshaler.Marshal(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq, err := http.NewRequestWithContext(b.requestContext(), "POST", b.rpcURL, bytes.NewBuffer(httpData))
+	if err != nil {
+		return nil, nil, err
+	}
+	httpReq.SetBasicAuth(b.user, b.password)
+	httpRes, err := b.client.Do(httpReq)
+	// in some cases the httpRes can contain data even if it returns error
+	// see http://devs.cloudimmunity.com/gotchas-and-common-mistakes-in-go-golang/
+	if httpRes != nil {
+		defer func() {
+			// The streaming decoder stops at the closing brace of the JSON
+			// object, leaving the trailing newline and the chunked-encoding
+			// terminator unread. net/http drains a remainder that small by
+			// itself, so connections are reused either way - measured, see
+			// TestGetBlockBytesReusesConnection. This explicit drain is cheap
+			// insurance for the paths where more than that is left over, and
+			// it is bounded because on a decode error the unread remainder can
+			// be gigabytes, which is not worth discarding.
+			io.CopyN(io.Discard, httpRes.Body, drainOnCloseLimit)
+			httpRes.Body.Close()
+		}()
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	// an error reply is small, there is no point in streaming it
+	if httpRes.StatusCode != 200 {
+		res := ResGetBlockRaw{}
+		if err = common.SafeDecodeResponseFromReader(httpRes.Body, &res); err != nil {
+			return nil, nil, errors.Errorf("%v %v", httpRes.Status, err)
+		}
+		if res.Error == nil {
+			return nil, nil, errors.New(httpRes.Status)
+		}
+		return nil, res.Error, nil
+	}
+	// the JSON envelope is "hex result" plus a few tens of bytes, so half of
+	// Content-Length is a safe upper bound of the decoded size
+	if sizeHint <= 0 && httpRes.ContentLength > 0 && httpRes.ContentLength <= 2*int64(common.HexStreamMaxSizeHint) {
+		sizeHint = int(httpRes.ContentLength / 2)
+	}
+	decoded, err := common.DecodeJSONRPCHexResult(httpRes.Body, sizeHint)
+	if err != nil {
+		return nil, nil, err
+	}
+	if decoded.Error != nil {
+		rpcErr := &bchain.RPCError{}
+		if err = json.Unmarshal(decoded.Error, rpcErr); err != nil {
+			return nil, nil, errors.Errorf("invalid error in JSON-RPC response: %v", err)
+		}
+		return nil, rpcErr, nil
+	}
+	if !decoded.ResultIsString {
+		return nil, nil, errors.New("missing result in JSON-RPC response")
+	}
+	return decoded.Result, nil, nil
 }
 
 // GetBlockFull returns block with given hash
