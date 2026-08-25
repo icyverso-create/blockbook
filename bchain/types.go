@@ -66,6 +66,11 @@ type ScriptPubKey struct {
 	Hex string `json:"hex,omitempty" ts_doc:"Hex-encoded representation of the scriptPubKey."`
 	// Type      string   `json:"type"`
 	Addresses []string `json:"addresses" ts_doc:"Addresses derived from this output's script (if known)."`
+	// Script is the raw scriptPubKey, an alternative to Hex for parsers that
+	// want to avoid the bytes->hex->bytes round trip on the sync path. It is
+	// never serialized; a parser that fills it must also read it back in its
+	// own GetAddrDescFromVout. Empty everywhere except where a parser opts in.
+	Script []byte `json:"-"`
 }
 
 // Vout contains data about tx output

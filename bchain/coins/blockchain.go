@@ -19,6 +19,7 @@ import (
 	"github.com/trezor/blockbook/bchain/coins/bitcore"
 	"github.com/trezor/blockbook/bchain/coins/bitzeny"
 	"github.com/trezor/blockbook/bchain/coins/bsc"
+	"github.com/trezor/blockbook/bchain/coins/bsv"
 	"github.com/trezor/blockbook/bchain/coins/btc"
 	"github.com/trezor/blockbook/bchain/coins/btg"
 	"github.com/trezor/blockbook/bchain/coins/cpuchain"
@@ -85,6 +86,7 @@ func init() {
 	BlockChainFactories["Ethereum Testnet Hoodi"] = eth.NewEthereumRPC
 	BlockChainFactories["Ethereum Testnet Hoodi Archive"] = eth.NewEthereumRPC
 	BlockChainFactories["Bcash"] = bch.NewBCashRPC
+	BlockChainFactories["Bitcoin SV"] = bsv.NewBSVRPC
 	BlockChainFactories["Bcash Testnet"] = bch.NewBCashRPC
 	BlockChainFactories["Bgold"] = btg.NewBGoldRPC
 	BlockChainFactories["Bgold Testnet"] = btg.NewBGoldRPC
