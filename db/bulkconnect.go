@@ -48,6 +48,42 @@ const (
 	maxBlockFilters           = 1000
 )
 
+// maxBulkUtxos bounds the bulk caches by the number of UTXOs they hold, which is
+// what actually consumes memory - unlike the counters above, which bound them by
+// the number of ADDRESSES.
+//
+// The difference is invisible on chains with ordinary address reuse and decisive
+// on chains without it. A heap profile of a Bitcoin SV sync attributed ~49% of the
+// live heap to AddrBalance.addUtxo and AddrBalance.manageUtxoMap: one Utxo costs
+// roughly 100 bytes, and every address that reaches 16 UTXOs additionally builds a
+// map[string]int keyed by a 32-byte txid, roughly doubling that. An address that
+// a data-writing service has used a million times is therefore hundreds of
+// megabytes - yet it counts as ONE entry against maxBulkBalances. That is how a
+// sync sat at 113 GB with the address counters only two thirds full.
+//
+// 0 disables the check and keeps the stock behaviour for every other coin.
+var maxBulkUtxos = 0
+
+// SetMaxBulkUtxos sets the UTXO budget of the bulk caches. Call before InitBulkConnect.
+func SetMaxBulkUtxos(n int) {
+	if n < 0 {
+		n = 0
+	}
+	maxBulkUtxos = n
+}
+
+// countBulkUtxos returns how many UTXOs the balances cache currently holds.
+// It is O(len(balances)) and only runs when the budget is enabled.
+func (b *BulkConnect) countBulkUtxos() int {
+	n := 0
+	for _, ab := range b.balances {
+		if ab != nil {
+			n += len(ab.Utxos)
+		}
+	}
+	return n
+}
+
 type bulkConnectStats struct {
 	blocks            uint64
 	txs               uint64
@@ -299,13 +335,20 @@ func (b *BulkConnect) connectBlockBitcoinType(block *bchain.Block, storeBlockTxs
 	}
 	var storeAddressesChan, storeBalancesChan chan error
 	var sa bool
-	if len(b.txAddressesMap) > maxBulkTxAddresses || len(b.balances) > maxBulkBalances {
+	// The UTXO budget is a second, independent trigger: on chains where a single
+	// address can hold hundreds of thousands of UTXOs the address counters below
+	// stay far from their limits while memory is already exhausted.
+	utxoOverBudget := false
+	if maxBulkUtxos > 0 && b.countBulkUtxos() > maxBulkUtxos {
+		utxoOverBudget = true
+	}
+	if utxoOverBudget || len(b.txAddressesMap) > maxBulkTxAddresses || len(b.balances) > maxBulkBalances {
 		sa = true
 		if len(b.txAddressesMap)+partialStoreAddresses > maxBulkTxAddresses {
 			storeAddressesChan = make(chan error)
 			go b.parallelStoreTxAddresses(storeAddressesChan, false)
 		}
-		if len(b.balances)+partialStoreBalances > maxBulkBalances {
+		if utxoOverBudget || len(b.balances)+partialStoreBalances > maxBulkBalances {
 			storeBalancesChan = make(chan error)
 			go b.parallelStoreBalances(storeBalancesChan, false)
 		}
